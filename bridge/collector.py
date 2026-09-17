@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -15,12 +17,56 @@ CURSOR_IDE_STATE = CURSOR_HOME / "ide_state.json"
 CURSOR_PROJECTS = CURSOR_HOME / "projects"
 ORCA = "orca"
 
+WORKING_STATES = {
+    "working",
+    "running",
+    "thinking",
+    "streaming",
+    "in-progress",
+    "in_progress",
+    "tool",
+    "active",
+}
+ATTENTION_STATES = {
+    "waiting",
+    "wait",
+    "ask",
+    "needs-input",
+    "needs_input",
+    "blocked",
+    "error",
+    "failed",
+}
+ENDED_STATES = {
+    "done",
+    "completed",
+    "idle",
+    "stopped",
+    "exited",
+    "interrupted",
+}
+
+IDLE_MARKERS = (
+    "[stable]",
+    "resume session",
+    "turn completed",
+    "start grok in a fresh",
+)
+SHELL_RE = re.compile(
+    r"(@[\w.-]+\s+\S+\s+[%$#])|(cristian@)|(❯\s*%)|(^%\s*$)",
+    re.I | re.M,
+)
+IDLE_PROMPT_RE = re.compile(
+    r"(│\s*[❯>]\s*(build anything)?\s*│)|([❯>]\s{4,})|(│\s*[❯>]\s*$)",
+    re.I | re.M,
+)
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _run_json(args: list[str], timeout: float = 8.0) -> dict[str, Any] | None:
+def _run_json(args: list[str], timeout: float = 10.0) -> dict[str, Any] | None:
     try:
         proc = subprocess.run(
             args,
@@ -31,21 +77,22 @@ def _run_json(args: list[str], timeout: float = 8.0) -> dict[str, Any] | None:
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
-    if proc.returncode != 0:
-        return None
     raw = (proc.stdout or "").strip()
     if not raw:
         return None
     try:
-        return json.loads(raw)
+        payload = json.loads(raw)
     except json.JSONDecodeError:
         start = raw.find("{")
         if start < 0:
             return None
         try:
-            return json.loads(raw[start:])
+            payload = json.loads(raw[start:])
         except json.JSONDecodeError:
             return None
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        return None
+    return payload
 
 
 def _result(payload: dict[str, Any] | None) -> Any:
@@ -56,122 +103,166 @@ def _result(payload: dict[str, Any] | None) -> Any:
     return payload
 
 
-def _item_key(item: dict[str, Any]) -> str:
-    return "|".join(
-        str(item.get(k) or "")
-        for k in ("kind", "agent", "name", "worktree", "id", "project")
-    )
+def _orca(args: list[str], env: str | None = None) -> Any:
+    cmd = [ORCA]
+    if env:
+        cmd += ["--environment", env]
+    cmd += args
+    return _result(_run_json(cmd))
 
 
-def _looks_blocked(text: str) -> bool:
-    t = (text or "").lower()
-    return any(
-        token in t
-        for token in (
-            "error",
-            "failed",
-            "blocked",
-            "need you",
-            "waiting for",
-            "permission",
-            "conflict",
-            "attention",
-        )
-    )
+def _environments() -> list[str | None]:
+    names: list[str | None] = [None]
+    data = _orca(["environment", "list", "--json"])
+    if isinstance(data, dict):
+        for row in data.get("environments") or []:
+            name = row.get("name")
+            if name:
+                names.append(str(name))
+    return names
+
+
+def _host_snapshots() -> list[tuple[str, Any, Any]]:
+    envs = _environments()
+
+    def one(env: str | None) -> tuple[str, Any, Any]:
+        label = env or "local"
+        ps = _orca(["worktree", "ps", "--json"], env)
+        terms = _orca(["terminal", "list", "--json"], env)
+        return label, ps, terms
+
+    out: list[tuple[str, Any, Any]] = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [pool.submit(one, env) for env in envs]
+        for fut in as_completed(futs):
+            try:
+                out.append(fut.result())
+            except Exception:
+                continue
+    return out
+
+
+def _classify_terminal(term: dict[str, Any]) -> str | None:
+    if not term.get("agentIdentity"):
+        return None
+    if not term.get("connected"):
+        return "ended"
+    preview = str(term.get("preview") or "")
+    low = preview.lower()
+    if term.get("agentWait"):
+        return "attention"
+    if any(tok in low for tok in ("need you", "waiting for permission", "ask the user")):
+        return "attention"
+    if SHELL_RE.search(preview) and "grok 4" not in low:
+        return None
+    idle = any(m in low for m in IDLE_MARKERS) or bool(IDLE_PROMPT_RE.search(preview))
+    last = term.get("lastOutputAt")
+    age_s = None
+    if isinstance(last, (int, float)) and last > 0:
+        age_s = (_now_ms() - last) / 1000.0
+    if idle:
+        return "ended"
+    if age_s is not None and age_s < 20:
+        return "working"
+    if age_s is not None and age_s < 90 and any(
+        tok in low for tok in ("thinking", "tool", "running", "worked for", "in progress")
+    ):
+        return "working"
+    return "ended"
+
+
+def _classify_agent(agent: dict[str, Any], unread: bool) -> str:
+    state = str(agent.get("state") or "").lower()
+    if unread and state in ENDED_STATES:
+        return "attention"
+    if state in ATTENTION_STATES or agent.get("interrupted"):
+        return "attention"
+    if state in WORKING_STATES:
+        return "working"
+    if state in ENDED_STATES:
+        return "ended"
+    return "ended"
 
 
 def collect_orca() -> dict[str, Any]:
-    ps = _result(_run_json([ORCA, "worktree", "ps", "--json"]))
-    terms = _result(_run_json([ORCA, "terminal", "list", "--json"]))
-    workers = _result(_run_json([ORCA, "orchestration", "worker-list", "--json"]))
-    tasks = _result(_run_json([ORCA, "orchestration", "task-list", "--json"]))
-
-    worktrees = []
-    if isinstance(ps, dict):
-        worktrees = ps.get("worktrees") or []
-    elif isinstance(ps, list):
-        worktrees = ps
-
-    terminals = []
-    if isinstance(terms, dict):
-        terminals = terms.get("terminals") or []
-    elif isinstance(terms, list):
-        terminals = terms
-
-    agent_terms = [t for t in terminals if t.get("connected") and t.get("agentIdentity")]
     working_items: list[dict[str, Any]] = []
     ended_items: list[dict[str, Any]] = []
     attention_items: list[dict[str, Any]] = []
+    seen: set[str] = set()
 
-    for term in agent_terms:
-        item = {
-            "kind": "terminal",
-            "id": str(term.get("handle") or term.get("title") or ""),
-            "name": term.get("title") or term.get("agentIdentity"),
-            "agent": term.get("agentIdentity"),
-            "worktree": Path(str(term.get("worktreePath") or "")).name,
-            "preview": (term.get("preview") or "")[-160:],
-        }
-        if _looks_blocked(str(term.get("preview") or "")):
+    def add(status: str, item: dict[str, Any]) -> None:
+        key = str(item.get("id") or "")
+        if not key or key in seen:
+            return
+        seen.add(key)
+        if status == "working":
+            working_items.append(item)
+        elif status == "attention":
             attention_items.append(item)
         else:
-            working_items.append(item)
-
-    seen_active = {t.get("worktreeId") for t in agent_terms}
-    for wt in worktrees:
-        status = (wt.get("workspaceStatus") or "").lower()
-        live = int(wt.get("liveTerminalCount") or 0)
-        name = wt.get("displayName") or wt.get("repo") or "worktree"
-        item = {
-            "kind": "worktree",
-            "name": name,
-            "repo": wt.get("repo"),
-            "status": status,
-            "live": live,
-            "comment": wt.get("comment") or "",
-            "preview": (wt.get("preview") or "")[-160:],
-        }
-        if wt.get("unread") or status in {"in-review", "blocked"} or _looks_blocked(item["comment"]):
-            attention_items.append(item)
-        elif status == "completed":
             ended_items.append(item)
-        elif live > 0 or wt.get("status") == "active" or wt.get("worktreeId") in seen_active:
-            if not any(w.get("worktree") == Path(str(wt.get("path") or "")).name for w in working_items):
-                working_items.append(item)
 
-    if isinstance(workers, dict):
-        rows = workers.get("workers") or workers.get("items") or []
-        for row in rows:
-            st = str(row.get("status") or row.get("state") or "").lower()
-            item = {"kind": "worker", "name": row.get("title") or row.get("id"), "status": st}
-            if st in {"failed", "blocked", "needs-attention", "error"}:
-                attention_items.append(item)
-            elif st in {"running", "active", "working"}:
-                working_items.append(item)
-            elif st in {"done", "completed", "stopped", "exited"}:
-                ended_items.append(item)
+    hosts = _host_snapshots()
+    available = bool(hosts)
+    for host, ps, terms in hosts:
+        worktrees = []
+        if isinstance(ps, dict):
+            worktrees = ps.get("worktrees") or []
+        terminals = []
+        if isinstance(terms, dict):
+            terminals = terms.get("terminals") or []
 
-    if isinstance(tasks, dict):
-        rows = tasks.get("tasks") or tasks.get("items") or []
-        for row in rows:
-            st = str(row.get("status") or "").lower()
-            item = {"kind": "task", "name": row.get("title") or row.get("id"), "status": st}
-            if st in {"blocked", "failed", "needs-attention"}:
-                attention_items.append(item)
-            elif st in {"running", "in-progress", "dispatched"}:
-                working_items.append(item)
-            elif st in {"done", "completed"}:
-                ended_items.append(item)
+        covered_panes: set[str] = set()
+        for wt in worktrees:
+            unread = bool(wt.get("unread"))
+            repo = wt.get("repo") or Path(str(wt.get("path") or "")).name
+            for agent in wt.get("agents") or []:
+                pane = str(agent.get("paneKey") or "")
+                aid = f"{host}:{pane or agent.get('updatedAt') or repo}"
+                covered_panes.add(pane)
+                item = {
+                    "kind": "agent",
+                    "id": aid,
+                    "name": agent.get("taskTitle")
+                    or (str(agent.get("prompt") or "")[:48] or repo),
+                    "agent": agent.get("agentType") or agent.get("displayName"),
+                    "worktree": repo,
+                    "host": host,
+                    "state": agent.get("state"),
+                    "unread": unread,
+                }
+                add(_classify_agent(agent, unread), item)
+
+        for term in terminals:
+            tab = term.get("tabId") or ""
+            leaf = term.get("leafId") or ""
+            pane = f"{tab}:{leaf}" if tab and leaf else ""
+            if pane and pane in covered_panes:
+                continue
+            status = _classify_terminal(term)
+            if not status:
+                continue
+            handle = str(term.get("handle") or pane)
+            item = {
+                "kind": "terminal",
+                "id": f"{host}:{handle}",
+                "name": term.get("title") or term.get("agentIdentity"),
+                "agent": term.get("agentIdentity"),
+                "worktree": Path(str(term.get("worktreePath") or "")).name,
+                "host": host,
+                "preview": (term.get("preview") or "")[-120:],
+            }
+            add(status, item)
 
     return {
-        "available": ps is not None or terms is not None,
+        "available": available,
         "working": len(working_items),
         "ended": len(ended_items),
         "attention": len(attention_items),
         "ids": {
-            "working": [_item_key(i) for i in working_items],
-            "ended": [_item_key(i) for i in ended_items],
-            "attention": [_item_key(i) for i in attention_items],
+            "working": [i["id"] for i in working_items],
+            "ended": [i["id"] for i in ended_items],
+            "attention": [i["id"] for i in attention_items],
         },
         "items": {
             "working": working_items[:8],
@@ -179,12 +270,8 @@ def collect_orca() -> dict[str, Any]:
             "attention": attention_items[:8],
         },
         "terminals": [
-            {
-                "title": t.get("title"),
-                "agent": t.get("agentIdentity"),
-                "connected": t.get("connected"),
-            }
-            for t in agent_terms
+            {"title": i.get("name"), "agent": i.get("agent"), "host": i.get("host")}
+            for i in working_items
         ],
     }
 
@@ -227,45 +314,6 @@ def _cursor_file() -> str | None:
     return str(path) if path else None
 
 
-def _cursor_agents() -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    if not CURSOR_PROJECTS.exists():
-        return items
-    cutoff = time.time() - 6 * 3600
-    for project in CURSOR_PROJECTS.iterdir():
-        transcripts = project / "agent-transcripts"
-        if not transcripts.is_dir():
-            continue
-        for path in transcripts.glob("*.jsonl"):
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                continue
-            if mtime < cutoff:
-                continue
-            last = _last_jsonl(path)
-            status = "ended"
-            if last:
-                kind = str(last.get("type") or last.get("role") or "").lower()
-                if kind in {"assistant", "thinking", "tool_call", "tool"}:
-                    if time.time() - mtime < 120:
-                        status = "working"
-                if last.get("error") or "ask" in kind:
-                    status = "attention"
-            if time.time() - mtime < 90:
-                status = "working"
-            items.append(
-                {
-                    "project": project.name[-24:],
-                    "id": path.stem[:10],
-                    "status": status,
-                    "age_s": int(time.time() - mtime),
-                }
-            )
-    items.sort(key=lambda x: x["age_s"])
-    return items[:12]
-
-
 def _last_jsonl(path: Path) -> dict[str, Any] | None:
     try:
         with path.open("rb") as fh:
@@ -279,9 +327,50 @@ def _last_jsonl(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _cursor_agents() -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    if not CURSOR_PROJECTS.exists():
+        return items
+    cutoff = time.time() - 15 * 60
+    for project in CURSOR_PROJECTS.iterdir():
+        transcripts = project / "agent-transcripts"
+        if not transcripts.is_dir():
+            continue
+        for path in transcripts.glob("*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            last = _last_jsonl(path)
+            status = "ended"
+            age = time.time() - mtime
+            if last:
+                kind = str(last.get("type") or last.get("role") or "").lower()
+                if last.get("error"):
+                    status = "attention"
+                elif kind in {"assistant", "thinking", "tool_call", "tool"} and age < 90:
+                    status = "working"
+            elif age < 45:
+                status = "working"
+            items.append(
+                {
+                    "kind": "cursor",
+                    "id": f"cursor:{path.stem}",
+                    "project": project.name[-24:],
+                    "name": path.stem[:10],
+                    "status": status,
+                    "age_s": int(age),
+                }
+            )
+    items.sort(key=lambda x: x["age_s"])
+    return items[:12]
+
+
 def collect_cursor() -> dict[str, Any]:
     proc = _cursor_running()
-    agents = _cursor_agents()
+    agents = _cursor_agents() if proc["running"] else []
     working = [a for a in agents if a["status"] == "working"]
     ended = [a for a in agents if a["status"] == "ended"]
     attention = [a for a in agents if a["status"] == "attention"]
@@ -301,24 +390,21 @@ def collect_cursor() -> dict[str, Any]:
 def snapshot() -> dict[str, Any]:
     orca = collect_orca()
     cursor = collect_cursor()
-    working = orca["working"] + cursor["working"] + (1 if cursor["running"] and not cursor["agents"] else 0)
+    working = orca["working"] + cursor["working"]
     ended = orca["ended"] + cursor["ended"]
     attention = orca["attention"] + cursor["attention"]
-    cursor_ids = {
-        "working": [_item_key(a) for a in cursor["agents"] if a["status"] == "working"],
-        "ended": [_item_key(a) for a in cursor["agents"] if a["status"] == "ended"],
-        "attention": [_item_key(a) for a in cursor["agents"] if a["status"] == "attention"],
-    }
-    orca_ids = orca.get("ids") or {"working": [], "ended": [], "attention": []}
     return {
         "ts": _now_ms(),
         "working": working,
         "ended": ended,
         "attention": attention,
         "ids": {
-            "working": orca_ids.get("working", []) + cursor_ids["working"],
-            "ended": orca_ids.get("ended", []) + cursor_ids["ended"],
-            "attention": orca_ids.get("attention", []) + cursor_ids["attention"],
+            "working": list(orca.get("ids", {}).get("working") or [])
+            + [a["id"] for a in cursor["agents"] if a["status"] == "working"],
+            "ended": list(orca.get("ids", {}).get("ended") or [])
+            + [a["id"] for a in cursor["agents"] if a["status"] == "ended"],
+            "attention": list(orca.get("ids", {}).get("attention") or [])
+            + [a["id"] for a in cursor["agents"] if a["status"] == "attention"],
         },
         "orca": orca,
         "cursor": cursor,

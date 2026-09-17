@@ -187,21 +187,18 @@ async def collector_loop(radio: WatchRadio, interval: float) -> None:
             if last_ids is None:
                 last_ids = ids
                 last_key = key
-            elif radio.connected and (event or count_changed) and now - last_push > 3:
+            elif radio.connected and (event or count_changed) and now - last_push > 2:
                 title, body, _alert = watch_text(snap)
                 last_key = key
                 last_ids = ids
                 last_push = now
                 windows_toast(title, body)
                 try:
-                    await radio.push_message(
-                        title,
-                        body,
-                        alert=True,
-                        working=working,
-                        ended=ended,
-                        attention=attn,
-                        event=event or "Count update.",
+                    await radio.speak_counts(
+                        working,
+                        ended,
+                        attn,
+                        event or "Count update.",
                     )
                 except Exception as exc:
                     log.warning("push failed: %s", exc)

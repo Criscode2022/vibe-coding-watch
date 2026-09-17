@@ -167,6 +167,17 @@ class WatchRadio:
             self.last_push = f"{title}: {body}"
             self.last_push_at = time.time()
 
+    async def speak_counts(
+        self,
+        working: int,
+        ended: int,
+        attention: int,
+        event: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(announce_counts, working, ended, attention, event)
+        self.last_push = event or f"{working} {ended} {attention}"
+        self.last_push_at = time.time()
+
     async def push_message(
         self,
         title: str,
@@ -178,15 +189,7 @@ class WatchRadio:
         attention: int = 0,
         event: str | None = None,
     ) -> None:
-        await self.push_visible(
-            title,
-            body,
-            working=working,
-            ended=ended,
-            attention=attention,
-            loud=True,
-            event=event,
-        )
+        await self.speak_counts(working, ended, attention, event)
 
     async def ping_find(self) -> None:
         async with self.lock:
