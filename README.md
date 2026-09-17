@@ -1,5 +1,7 @@
 # VibeOS — coding watch for the ZTE Watch Live 3
 
+**Agents continuing this project:** read [HANDOFF.md](HANDOFF.md) first (hardware, protocol, what worked, what not to retry).
+
 Mac Mini counts Orca agents. iPhone is the Bluetooth bridge to the watch, so counts speak on your wrist anywhere the phone and watch are paired.
 
 ```
