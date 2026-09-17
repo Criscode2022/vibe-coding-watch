@@ -58,8 +58,9 @@ async function poll() {
 
     const radio = document.getElementById("radio");
     const up = Boolean(s.watch && s.watch.connected);
-    radio.textContent = up ? "LIVE" : "BT";
-    radio.classList.toggle("dead", !up);
+    const iphone = s.watch && s.watch.bridge === "iphone";
+    radio.textContent = up ? "LIVE" : iphone ? "PHONE" : "BT";
+    radio.classList.toggle("dead", !up && !iphone);
 
     renderList(document.getElementById("orca-list"), s.orca?.items?.working || [], "no orca agents");
 

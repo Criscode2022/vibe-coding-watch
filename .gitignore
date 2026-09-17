@@ -6,3 +6,7 @@ data/*.log
 data/*.err
 __pycache__/
 *.pyc
+.DS_Store
+xcuserdata/
+*.xcuserstate
+DerivedData/

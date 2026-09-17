@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import subprocess
 import time
@@ -111,15 +112,20 @@ def _orca(args: list[str], env: str | None = None) -> Any:
     return _result(_run_json(cmd))
 
 
+def orca_source() -> str:
+    explicit = (os.environ.get("VIBEOS_ORCA_SOURCE") or "").strip()
+    if explicit:
+        return explicit
+    if platform.system() == "Darwin":
+        return "local"
+    return "Mac Mini"
+
+
 def _environments() -> list[str | None]:
-    names: list[str | None] = [None]
-    data = _orca(["environment", "list", "--json"])
-    if isinstance(data, dict):
-        for row in data.get("environments") or []:
-            name = row.get("name")
-            if name:
-                names.append(str(name))
-    return names
+    source = orca_source()
+    if source.lower() in {"local", "darwin", "this"}:
+        return [None]
+    return [source]
 
 
 def _host_snapshots() -> list[tuple[str, Any, Any]]:
@@ -389,23 +395,19 @@ def collect_cursor() -> dict[str, Any]:
 
 def snapshot() -> dict[str, Any]:
     orca = collect_orca()
-    cursor = collect_cursor()
-    working = orca["working"] + cursor["working"]
-    ended = orca["ended"] + cursor["ended"]
-    attention = orca["attention"] + cursor["attention"]
     return {
         "ts": _now_ms(),
-        "working": working,
-        "ended": ended,
-        "attention": attention,
-        "ids": {
-            "working": list(orca.get("ids", {}).get("working") or [])
-            + [a["id"] for a in cursor["agents"] if a["status"] == "working"],
-            "ended": list(orca.get("ids", {}).get("ended") or [])
-            + [a["id"] for a in cursor["agents"] if a["status"] == "ended"],
-            "attention": list(orca.get("ids", {}).get("attention") or [])
-            + [a["id"] for a in cursor["agents"] if a["status"] == "attention"],
-        },
+        "source": orca_source(),
+        "working": orca["working"],
+        "ended": orca["ended"],
+        "attention": orca["attention"],
+        "ids": orca.get("ids") or {"working": [], "ended": [], "attention": []},
         "orca": orca,
-        "cursor": cursor,
+        "cursor": {
+            "running": False,
+            "working": 0,
+            "ended": 0,
+            "attention": 0,
+            "agents": [],
+        },
     }

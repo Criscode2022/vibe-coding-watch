@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.vibeos.bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>VIBEOS_PYTHON</string>
+    <string>VIBEOS_ROOT/bridge/server.py</string>
+    <string>--host</string>
+    <string>0.0.0.0</string>
+    <string>--port</string>
+    <string>7733</string>
+    <string>--orca-source</string>
+    <string>local</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>VIBEOS_ROOT</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>VIBEOS_ROOT/data/vibeos.log</string>
+  <key>StandardErrorPath</key>
+  <string>VIBEOS_ROOT/data/vibeos.err</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>VIBEOS_ORCA_SOURCE</key>
+    <string>local</string>
+  </dict>
+</dict>
+</plist>

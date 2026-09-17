@@ -1,32 +1,60 @@
 # VibeOS — coding watch for the ZTE Watch Live 3
 
-The Live 3 (SW2301) is a locked Realtek/IDO fitness watch, not Wear OS. It has no ADB, no fastboot, and no public firmware. A custom kernel cannot be flashed over Bluetooth.
+Mac Mini counts Orca agents. iPhone is the Bluetooth bridge to the watch, so counts speak on your wrist anywhere the phone and watch are paired.
 
-VibeOS is the layer that can run: a 240×284 companion face plus a Windows bridge that talks to the watch over BLE (`GATT 0x27F0`) and speaks agent counts through the Hands-Free speaker.
-
-## Wrist audio
-
-When an Orca or Cursor agent **starts working**, **finishes**, or **needs attention**, the watch speaks the counts, for example:
-
-> Started working. Vibe OS. 1 working. 0 ended. 0 need attention.
-
-Manual **push now** on the face repeats the current counts. Keep the watch paired to this PC (Hands-Free + BLE). Pairing it back to a phone in ZSports drops the speaker.
-
-## Face rows
-
-| Row | Source |
-| --- | --- |
-| working | live Orca agent terminals + recent Cursor agents |
-| ended | completed Orca worktrees + idle Cursor transcripts |
-| attention | unread / blocked Orca cards, Cursor errors |
-
-## Run
-
-```powershell
-cd $env:USERPROFILE\GitHub\vibe-coding-watch
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\start.ps1
+```
+Orca on Mac Mini  →  VibeOS daemon :7733  →  iPhone (Tailscale)  →  ZTE Live 3 speaker
 ```
 
-Face: `http://127.0.0.1:7733/`
+## What the watch says
+
+When a Mac Mini Orca agent **starts**, **finishes**, or **needs attention**:
+
+> Started working. 1 working. 5 ended. 0 need attention.
+
+## 1. Always-on Mac Mini
+
+Needs `orca` on the PATH (Orca app / CLI). Then:
+
+```bash
+git clone git@github.com:Criscode2022/vibe-coding-watch.git ~/GitHub/vibe-coding-watch
+cd ~/GitHub/vibe-coding-watch
+chmod +x macos/install-mac.sh
+./macos/install-mac.sh
+```
+
+That installs a LaunchAgent (`com.vibeos.bridge`) which keeps `http://0.0.0.0:7733/` up after reboot. Check:
+
+```bash
+curl -s http://127.0.0.1:7733/api/state | python3 -m json.tool
+```
+
+Leave Tailscale running on the Mini. Note the Mini’s Tailscale IP (example used in the iPhone app: `http://100.118.53.14:7733`).
+
+## 2. iPhone as watch bridge
+
+1. Pair the **ZTE WATCH Live3** to the iPhone as a Bluetooth headset (Settings → Bluetooth). Quit **Z Sports** so it does not steal the radio.
+2. Install Tailscale on the iPhone and join the same tailnet as the Mini.
+3. On the Mac Mini, open `ios/VibeOS/VibeOS.xcodeproj` in Xcode, set your Team, plug in the iPhone, Run.
+4. In VibeOS, set **Mac Mini Tailscale URL** to `http://<mini-tailscale-ip>:7733` and tap **Save URL**.
+5. Keep VibeOS open (or in the background). It polls `/api/state` and speaks counts through the watch Hands-Free speaker.
+
+**Speak counts** in the app repeats the current totals.
+
+## Agent counts (Mac Mini only)
+
+| Row | Meaning |
+| --- | --- |
+| working | Orca agent currently in a turn |
+| ended | idle / `done` agent |
+| attention | unread finished work or a wait/block |
+
+Windows Orca tabs are ignored.
+
+## Optional: watch paired to a computer
+
+```bash
+python3 bridge/server.py --radio --speak-local
+```
+
+That talks BLE/HFP from the machine itself instead of the iPhone.

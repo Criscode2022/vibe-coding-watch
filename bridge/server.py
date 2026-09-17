@@ -1,4 +1,4 @@
-"""VibeOS bridge: Orca + Cursor snapshot, BLE watch radio, 240x284 face."""
+"""VibeOS: Mac Mini agent API + optional local watch radio."""
 
 from __future__ import annotations
 
@@ -7,11 +7,11 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import subprocess
 import sys
 import threading
 import time
-import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -20,14 +20,30 @@ VIBEOS = ROOT / "vibeos"
 DATA = ROOT / "data"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ble_watch import WatchRadio  # noqa: E402
 from collector import snapshot  # noqa: E402
 
 log = logging.getLogger("vibeos")
 STATE_LOCK = threading.Lock()
-STATE: dict = {"working": 0, "ended": 0, "attention": 0, "watch": {}, "ts": 0}
-RADIO: WatchRadio | None = None
+STATE: dict = {
+    "working": 0,
+    "ended": 0,
+    "attention": 0,
+    "watch": {},
+    "event": None,
+    "ts": 0,
+    "source": None,
+}
+RADIO = None
+SPEAK_LOCAL = False
 STOP = asyncio.Event()
+LOOP: asyncio.AbstractEventLoop
+
+
+def _cors(handler: SimpleHTTPRequestHandler) -> None:
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    handler.send_header("Cache-Control", "no-store")
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -37,18 +53,39 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         log.info("http " + fmt, *args)
 
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        self.send_response(204)
+        _cors(self)
+        self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path.startswith("/api/state"):
             with STATE_LOCK:
                 body = json.dumps(STATE).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            _cors(self)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path.startswith("/api/events"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            _cors(self)
+            self.end_headers()
+            last = None
+            try:
+                while True:
+                    with STATE_LOCK:
+                        payload = json.dumps(STATE)
+                    if payload != last:
+                        self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                        last = payload
+                    time.sleep(1.0)
+            except BrokenPipeError:
+                return
         if self.path in ("/", "/index.html"):
             self.path = "/index.html"
         return super().do_GET()
@@ -63,82 +100,58 @@ class Handler(SimpleHTTPRequestHandler):
         action = (payload.get("action") or self.path.rsplit("/", 1)[-1]).strip()
         ok = True
         err = None
-        if RADIO is None:
-            ok, err = False, "radio down"
-        else:
-            try:
-                if action == "find":
-                    asyncio.run_coroutine_threadsafe(RADIO.ping_find(), LOOP).result(8)
-                elif action == "push":
-                    title = payload.get("title") or "VibeOS"
-                    body = payload.get("body") or "LOOK AT WATCH"
-                    with STATE_LOCK:
-                        working = int(STATE.get("working") or 0)
-                        ended = int(STATE.get("ended") or 0)
-                        attention = int(STATE.get("attention") or 0)
-                    asyncio.run_coroutine_threadsafe(
-                        RADIO.push_message(
-                            title,
-                            body,
-                            alert=True,
-                            working=working,
-                            ended=ended,
-                            attention=attention,
-                        ),
-                        LOOP,
-                    ).result(20)
+        try:
+            if action in {"push", "speak"}:
+                with STATE_LOCK:
+                    working = int(STATE.get("working") or 0)
+                    ended = int(STATE.get("ended") or 0)
+                    attention = int(STATE.get("attention") or 0)
+                event = payload.get("event") or "Count update."
+                asyncio.run_coroutine_threadsafe(
+                    announce(working, ended, attention, event), LOOP
+                ).result(25)
+            elif action == "find":
+                if RADIO is None:
+                    ok, err = False, "no local radio (use iPhone bridge)"
                 else:
-                    ok, err = False, f"unknown action {action}"
-            except Exception as exc:
-                ok, err = False, repr(exc)
+                    asyncio.run_coroutine_threadsafe(RADIO.ping_find(), LOOP).result(8)
+            else:
+                ok, err = False, f"unknown action {action}"
+        except Exception as exc:
+            ok, err = False, repr(exc)
         body = json.dumps({"ok": ok, "error": err}).encode("utf-8")
         self.send_response(200 if ok else 500)
         self.send_header("Content-Type", "application/json")
+        _cors(self)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
 
-LOOP: asyncio.AbstractEventLoop
-
-
-def windows_toast(title: str, body: str) -> None:
-    ps = r"""
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-$n = New-Object System.Windows.Forms.NotifyIcon
-$n.Icon = [System.Drawing.SystemIcons]::Information
-$n.Visible = $true
-$n.ShowBalloonTip(4000, @'
-{title}
-'@, @'
-{body}
-'@, [System.Windows.Forms.ToolTipIcon]::Info)
-Start-Sleep -Seconds 4
-$n.Dispose()
-""".replace("{title}", title.replace("'", "''")).replace("{body}", body.replace("'", "''"))
+def say_local(text: str) -> None:
+    if platform.system() != "Darwin":
+        return
     try:
-        subprocess.Popen(
-            [
-                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-                "-NoProfile",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                ps,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        subprocess.Popen(["say", "-r", "190", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
 
 
-def watch_text(snap: dict) -> tuple[str, str, bool]:
-    working, ended, attn = snap["working"], snap["ended"], snap["attention"]
-    title = "VibeOS"
-    body = f"{working} work {ended} done {attn} attn"
-    return title, body, attn > 0
+async def announce(working: int, ended: int, attention: int, event: str | None) -> None:
+    line_bits = [
+        event or "",
+        f"{working} working.",
+        f"{ended} ended.",
+        f"{attention} need attention.",
+    ]
+    line = " ".join(b for b in line_bits if b).strip()
+    if SPEAK_LOCAL:
+        say_local(line)
+    if RADIO is not None:
+        try:
+            await RADIO.speak_counts(working, ended, attention, event)
+        except Exception as exc:
+            log.warning("radio speak: %s", exc)
 
 
 def _id_sets(snap: dict) -> dict[str, set[str]]:
@@ -163,48 +176,46 @@ def _status_event(prev: dict[str, set[str]] | None, cur: dict[str, set[str]]) ->
     return " ".join(bits) if bits else None
 
 
-async def collector_loop(radio: WatchRadio, interval: float) -> None:
+async def collector_loop(interval: float) -> None:
     last_key = None
     last_ids: dict[str, set[str]] | None = None
     last_push = 0.0
     while not STOP.is_set():
         try:
             snap = snapshot()
-            snap["watch"] = radio.status()
-            with STATE_LOCK:
-                STATE.clear()
-                STATE.update(snap)
-            DATA.mkdir(parents=True, exist_ok=True)
-            (DATA / "snapshot.json").write_text(json.dumps(snap, indent=2), encoding="utf-8")
+            if RADIO is not None:
+                snap["watch"] = RADIO.status()
+            else:
+                snap["watch"] = {"connected": False, "bridge": "iphone"}
             working = int(snap["working"])
             ended = int(snap["ended"])
             attn = int(snap["attention"])
             key = (working, ended, attn)
             ids = _id_sets(snap)
-            now = time.time()
             event = _status_event(last_ids, ids)
             count_changed = last_key is not None and key != last_key
+            now = time.time()
             if last_ids is None:
                 last_ids = ids
                 last_key = key
-            elif radio.connected and (event or count_changed) and now - last_push > 2:
-                title, body, _alert = watch_text(snap)
+            elif (event or count_changed) and now - last_push > 2:
                 last_key = key
                 last_ids = ids
                 last_push = now
-                windows_toast(title, body)
+                snap["event"] = event or "Count update."
+                snap["event_ts"] = int(now * 1000)
                 try:
-                    await radio.speak_counts(
-                        working,
-                        ended,
-                        attn,
-                        event or "Count update.",
-                    )
+                    await announce(working, ended, attn, event or "Count update.")
                 except Exception as exc:
-                    log.warning("push failed: %s", exc)
+                    log.warning("announce: %s", exc)
             else:
                 last_ids = ids
                 last_key = key
+            with STATE_LOCK:
+                STATE.clear()
+                STATE.update(snap)
+            DATA.mkdir(parents=True, exist_ok=True)
+            (DATA / "snapshot.json").write_text(json.dumps(snap, indent=2), encoding="utf-8")
         except Exception as exc:
             log.exception("collector: %s", exc)
         try:
@@ -213,61 +224,44 @@ async def collector_loop(radio: WatchRadio, interval: float) -> None:
             pass
 
 
-def open_face(port: int) -> None:
-    url = f"http://127.0.0.1:{port}/"
-    edge = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft/Edge/Application/msedge.exe"
-    if not edge.exists():
-        edge = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft/Edge/Application/msedge.exe"
-    args = [
-        str(edge),
-        f"--app={url}",
-        "--window-size=280,360",
-        "--window-position=40,40",
-    ]
-    if edge.exists():
-        try:
-            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
-        except OSError:
-            pass
-    webbrowser.open(url)
-
-
-async def amain(port: int, interval: float, open_ui: bool) -> None:
+async def amain(host: str, port: int, interval: float, use_radio: bool) -> None:
     global LOOP, RADIO
     LOOP = asyncio.get_running_loop()
-    radio = WatchRadio()
-    RADIO = radio
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    log.info("VibeOS face http://127.0.0.1:%s/", port)
-    if open_ui:
-        open_face(port)
-    tasks = [
-        asyncio.create_task(radio.run_forever(STOP), name="radio"),
-        asyncio.create_task(collector_loop(radio, interval), name="collector"),
-    ]
+    if use_radio:
+        from ble_watch import WatchRadio
+
+        RADIO = WatchRadio()
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    log.info("VibeOS API http://%s:%s/  (iPhone polls /api/state)", host, port)
+    tasks = [asyncio.create_task(collector_loop(interval), name="collector")]
+    if RADIO is not None:
+        tasks.append(asyncio.create_task(RADIO.run_forever(STOP), name="radio"))
     try:
         await asyncio.gather(*tasks)
     finally:
         httpd.shutdown()
-        await radio.close()
+        if RADIO is not None:
+            await RADIO.close()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="VibeOS watch bridge")
+    global SPEAK_LOCAL
+    parser = argparse.ArgumentParser(description="VibeOS Mac Mini agent API")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7733)
     parser.add_argument("--interval", type=float, default=3.0)
-    parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--radio", action="store_true", help="talk to a watch paired to this machine")
+    parser.add_argument("--speak-local", action="store_true", help="also speak on this Mac")
+    parser.add_argument("--orca-source", default="", help="local or 'Mac Mini'")
     args = parser.parse_args()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    if args.orca_source:
+        os.environ["VIBEOS_ORCA_SOURCE"] = args.orca_source
+    SPEAK_LOCAL = args.speak_local
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     DATA.mkdir(parents=True, exist_ok=True)
     try:
-        asyncio.run(amain(args.port, args.interval, not args.no_browser))
+        asyncio.run(amain(args.host, args.port, args.interval, args.radio))
     except KeyboardInterrupt:
         STOP.set()
     return 0
