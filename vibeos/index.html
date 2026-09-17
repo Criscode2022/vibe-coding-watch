@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=240, height=284, initial-scale=1, user-scalable=no">
+  <title>VibeOS</title>
+  <link rel="stylesheet" href="os.css">
+</head>
+<body>
+  <main id="watch" class="watch">
+    <div class="bezel" data-attn="0">
+      <section class="page face" data-page="0">
+        <header class="clock">
+          <time id="clock">00:00</time>
+          <span id="radio" class="pill dead">BT</span>
+        </header>
+        <ol class="counts">
+          <li class="row work">
+            <b id="working">0</b>
+            <span>working</span>
+          </li>
+          <li class="row done">
+            <b id="ended">0</b>
+            <span>ended</span>
+          </li>
+          <li class="row attn">
+            <b id="attention">0</b>
+            <span>attention</span>
+          </li>
+        </ol>
+        <footer class="ticker" id="ticker">booting radio…</footer>
+      </section>
+
+      <section class="page orca" data-page="1" hidden>
+        <h1>Orca</h1>
+        <ul id="orca-list" class="list"></ul>
+      </section>
+
+      <section class="page cursor" data-page="2" hidden>
+        <h1>Cursor</h1>
+        <p id="cursor-file" class="file">—</p>
+        <ul id="cursor-list" class="list"></ul>
+      </section>
+
+      <section class="page radio" data-page="3" hidden>
+        <h1>Radio</h1>
+        <p id="radio-detail" class="file"></p>
+        <div class="actions">
+          <button type="button" id="btn-find">find watch</button>
+          <button type="button" id="btn-push">push now</button>
+        </div>
+      </section>
+    </div>
+    <nav class="dots" aria-label="pages">
+      <button data-go="0" class="on"></button>
+      <button data-go="1"></button>
+      <button data-go="2"></button>
+      <button data-go="3"></button>
+    </nav>
+  </main>
+  <script src="os.js"></script>
+</body>
+</html>

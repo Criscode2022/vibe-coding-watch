@@ -1,0 +1,8 @@
+.venv/
+data/*.json
+data/*.wav
+data/*.txt
+data/*.log
+data/*.err
+__pycache__/
+*.pyc
